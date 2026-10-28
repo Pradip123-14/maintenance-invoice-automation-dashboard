@@ -37,7 +37,7 @@ def clean_text(s):
     s=re.sub(r'[ \t]+',' ',s)
     s=re.sub(r'\n{3,}','\n\n',s)
     return s.strip()
-
+ 
 def configure_tesseract():
     try:
         import pytesseract
@@ -173,7 +173,7 @@ def extract_non_fort_summary(text, lines):
     # Normalize US-style date only for Popular's MM/DD/YYYY date format.
     if result['inv_date'] and re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', result['inv_date']):
         a,b,y=map(int,result['inv_date'].split('/'))
-        if a <= 12 and b <= 12 and a > 0 and b > 0:
+        if a <= 12 and b <= 31 and a > 0 and b > 0:
             # Popular header uses MM/DD/YYYY; Star uses DD/MM/YYYY.
             if re.search(r'Popular Vehicles', result['supplier'], re.I):
                 result['inv_date']=f'{b:02d}/{a:02d}/{y:04d}'
@@ -182,87 +182,125 @@ def extract_non_fort_summary(text, lines):
     ], text).replace(' ','').upper()
 
     if re.search(r'(?i)Star Motor Works', result['supplier'] + ' ' + text[:500]):
-        # Star uses Products and Services sections and a Grand Total row.
-        result['parts_before'] = None
-        result['labour_before'] = None
-        for line in lines:
-            if re.search(r'^\s*Total\s*:', line, re.I):
-                vals=amounts_on_line(line)
-                # The first Total after Products is the products-with-GST total, not taxable base.
-                # Detailed table totals are verified from the invoice summary where available.
-        # Explicit taxable summary on page 2: Taxable Products Amount / Taxable Service Amount.
-        mp=re.search(r'(?i)Taxable\s+Products\s+Amount\s*\(Rs\.?\)\s*:\s*([\d,]+(?:\.\d{1,2})?)', text)
-        ms=re.search(r'(?i)Taxable\s+Service\s+Amount\s*\(Rs\.?\)\s*:\s*([\d,]+(?:\.\d{1,2})?)', text)
-        if mp: result['parts_before']=float(mp.group(1).replace(',',''))
-        if ms: result['labour_before']=float(ms.group(1).replace(',',''))
-        # Product and service GST summary; values may be rounded whole rupees, so use detailed grand-total row.
-        cgst_total=first_match([r'(?i)Grand\s+Total\s*:.*?([\d,]+\.\d{2})\s+0\s+[\d,]+\.\d{2}\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})'], text)
-        # More robust line parse: Grand Total row has taxable total, discount, taxable net, CGST, SGST, IGST, grand total.
-        for line in lines:
-            if re.search(r'Grand\s+Total\s*:', line, re.I):
-                vals=amounts_on_line(line)
-                # Typical row: taxable gross, discount, taxable net, CGST, SGST, IGST, grand total.
-                if len(vals)>=5:
-                    result['cgst_total']=vals[-4]
-                    result['sgst_total']=vals[-3]
-                    result['total']=vals[-1]
-        if result['cgst_total'] is None:
-            m=re.search(r'(?i)Grand\s+Total\s*:\s*[\d,.]+\s+0\s+[\d,.]+\s+([\d,.]+)\s+([\d,.]+)\s+0\s+0\s+([\d,.]+)',text)
-            if m:
-                result['cgst_total']=float(m.group(1).replace(',',''))
-                result['sgst_total']=float(m.group(2).replace(',',''))
-                result['total']=float(m.group(3).replace(',',''))
-        # Detail summary lists products/service GST; use exact cents when available.
-        prod_cgst=first_match([r'(?i)CGST\s+on\s+Products\s*\(Rs\.?\)\s*:\s*([\d,.]+)'],text)
-        serv_cgst=first_match([r'(?i)CGST\s+on\s+Service\s*\(Rs\.?\)\s*:\s*([\d,.]+)'],text)
-        prod_sgst=first_match([r'(?i)SGST\s+on\s+Products\s*\(Rs\.?\)\s*:\s*([\d,.]+)'],text)
-        serv_sgst=first_match([r'(?i)SGST\s+on\s+Service\s*\(Rs\.?\)\s*:\s*([\d,.]+)'],text)
-        if prod_cgst and serv_cgst:
-            result['pcg']=float(prod_cgst.replace(',','')); result['lcg']=float(serv_cgst.replace(',',''))
-        if prod_sgst and serv_sgst:
-            result['psg']=float(prod_sgst.replace(',','')); result['lsg']=float(serv_sgst.replace(',',''))
-        # Use detailed exact CGST/SGST totals from the Grand Total row to avoid rounded summary values.
-        if result['cgst_total'] is not None and result['pcg'] is not None and result['lcg'] is not None:
-            result['cgst_total']=round(result['pcg']+result['lcg'],2)
-        if result['sgst_total'] is not None and result['psg'] is not None and result['lsg'] is not None:
-            result['sgst_total']=round(result['psg']+result['lsg'],2)
-        # Discounts aren't itemized in the summary by category in this vendor layout.
-        result['parts_disc']=0.0
-        result['labour_disc']=0.0
+        # Star Motor Works invoice 96 format:
+        # Product taxable value = Parts Cost; Service taxable value = Labour Cost.
+        mp = re.search(r'(?i)Taxable\s+Products\s+Amount\s*\(Rs\.?\)\s*:\s*([\d,]+(?:\.\d{1,2})?)', text)
+        ms = re.search(r'(?i)Taxable\s+Service\s+Amount\s*\(Rs\.?\)\s*:\s*([\d,]+(?:\.\d{1,2})?)', text)
+        if mp:
+            result['parts_before'] = float(mp.group(1).replace(',', ''))
+        if ms:
+            result['labour_before'] = float(ms.group(1).replace(',', ''))
+
+        # Read the detailed HSN summary for precise tax values (the invoice's
+        # top summary rounds product/service tax to whole rupees).
+        hsn_rows = []
+        hsn_start = re.search(r'(?i)HSN/SAC\s+Taxable Amount', text)
+        hsn_end = re.search(r'(?im)^\s*Total\s*:', text[hsn_start.end():]) if hsn_start else None
+        hsn_text = text[hsn_start.end():hsn_start.end()+5000] if hsn_start else ''
+        if hsn_start and hsn_end:
+            hsn_text = text[hsn_start.end():hsn_start.end()+hsn_end.start()]
+        # PDF extraction may place every table cell on a separate line, so match
+        # across whitespace rather than assuming one HSN record per text line.
+        row_pattern = re.compile(
+            r'(?<!\d)(\d{4,8})\s+([\d,]+\.\d{2})\s+9\.00\s+([\d,]+\.\d{2})\s+9\.00\s+([\d,]+\.\d{2})\s+0\.00\s+0\.00\s+([\d,]+\.\d{2})'
+        )
+        for m in row_pattern.finditer(hsn_text):
+            hsn_rows.append({
+                'hsn': m.group(1),
+                'taxable': float(m.group(2).replace(',', '')),
+                'cgst': float(m.group(3).replace(',', '')),
+                'sgst': float(m.group(4).replace(',', '')),
+            })
+
+        # Product HSNs are 2903/8415/8708; service HSN is 998729.
+        product_rows = [x for x in hsn_rows if x['hsn'] != '998729']
+        service_rows = [x for x in hsn_rows if x['hsn'] == '998729']
+        if product_rows and service_rows:
+            result['pcg'] = round(sum(x['cgst'] for x in product_rows), 2)
+            result['psg'] = round(sum(x['sgst'] for x in product_rows), 2)
+            result['lcg'] = round(sum(x['cgst'] for x in service_rows), 2)
+            result['lsg'] = round(sum(x['sgst'] for x in service_rows), 2)
+
+        # If the detailed HSN rows cannot be parsed, use the explicit summary values.
+        if result['pcg'] is None:
+            prod_cgst = first_match([r'(?i)CGST\s+on\s+Products\s*\(Rs\.?\)\s*:\s*([\d,.]+)'], text)
+            if prod_cgst: result['pcg'] = float(prod_cgst.replace(',', ''))
+        if result['lcg'] is None:
+            serv_cgst = first_match([r'(?i)CGST\s+on\s+Service\s*\(Rs\.?\)\s*:\s*([\d,.]+)'], text)
+            if serv_cgst: result['lcg'] = float(serv_cgst.replace(',', ''))
+        if result['psg'] is None:
+            prod_sgst = first_match([r'(?i)SGST\s+on\s+Products\s*\(Rs\.?\)\s*:\s*([\d,.]+)'], text)
+            if prod_sgst: result['psg'] = float(prod_sgst.replace(',', ''))
+        if result['lsg'] is None:
+            serv_sgst = first_match([r'(?i)SGST\s+on\s+Service\s*\(Rs\.?\)\s*:\s*([\d,.]+)'], text)
+            if serv_sgst: result['lsg'] = float(serv_sgst.replace(',', ''))
+
+        result['cgst_total'] = round((result['pcg'] or 0) + (result['lcg'] or 0), 2)
+        result['sgst_total'] = round((result['psg'] or 0) + (result['lsg'] or 0), 2)
+
+        # No discount is shown in the Star summary; taxable amounts above are net.
+        result['parts_disc'] = 0.0
+        result['labour_disc'] = 0.0
+
+        # Prefer explicit grand total (invoice says Total Amount With GST = 20,027).
+        total_text = first_match([
+            r'(?i)Total\s+Amount\s+With\s+GST\s*\(Rs\.?\)\s*:\s*([\d,]+(?:\.\d{1,2})?)',
+            r'(?i)Total\s+Amount\s+With\s+GST\s*:\s*([\d,]+(?:\.\d{1,2})?)'
+        ], text)
+        if total_text:
+            result['total'] = float(total_text.replace(',', ''))
+        else:
+            for line in lines:
+                if re.search(r'Grand\s+Total\s*:', line, re.I):
+                    vals = amounts_on_line(line)
+                    if vals:
+                        result['total'] = vals[-1]
+                        break
     elif re.search(r'(?i)Popular Vehicles', result['supplier'] + ' ' + text[:500]):
-        # Popular summary has Parts / Labour columns on each row.
-        for line in lines:
-            if re.search(r'^\s*Sub\s*Total\s*:', line, re.I):
-                vals=amounts_on_line(line)
-                if len(vals)>=2:
-                    result['parts_before'],result['labour_before']=vals[0],vals[-1]
-                    break
-        for line in lines:
-            if re.search(r'^\s*Less\s+Discount\s*:', line, re.I):
-                vals=amounts_on_line(line)
-                if len(vals)>=2:
-                    result['parts_disc'],result['labour_disc']=vals[0],vals[-1]
-                    break
-        cg=[]; sg=[]
-        for line in lines:
-            if re.search(r'^\s*CGST\s*@',line,re.I):
-                v=amounts_on_line(line)
-                if len(v)>=2: cg.append(v)
-            if re.search(r'^\s*SGST\s*@',line,re.I):
-                v=amounts_on_line(line)
-                if len(v)>=2: sg.append(v)
-        if cg:
-            result['pcg'],result['lcg']=cg[0][0],cg[0][-1]
-            result['cgst_total']=round(result['pcg']+result['lcg'],2)
-        if sg:
-            result['psg'],result['lsg']=sg[0][0],sg[0][-1]
-            result['sgst_total']=round(result['psg']+result['lsg'],2)
-        for line in lines:
-            if re.search(r'Net\s+Bill\s+Amount',line,re.I):
-                vals=amounts_on_line(line)
-                if vals: result['total']=vals[-1]; break
-        result['parts_disc']=result['parts_disc'] if result['parts_disc'] is not None else 0.0
-        result['labour_disc']=result['labour_disc'] if result['labour_disc'] is not None else 0.0
+        # Popular's summary labels and amounts are often extracted onto separate lines.
+        # Read the next few lines after each label rather than requiring amounts on the label line.
+        def popular_summary_values(pattern, occurrence=0, lines_after=4):
+            hits = [i for i, line in enumerate(lines) if re.search(pattern, line, re.I)]
+            if len(hits) <= occurrence:
+                return []
+            i = hits[occurrence]
+            chunk = ' '.join(lines[i + 1:min(len(lines), i + lines_after + 1)])
+            return amounts_on_line(chunk)
+
+        subtotal_first = popular_summary_values(r'^\s*Sub\s*Total\s*:?\s*$', occurrence=0, lines_after=3)
+        # The second "Sub Total" is the net amount after discount and tax, split by Parts/Labour.
+        subtotal_net = popular_summary_values(r'^\s*Sub\s*Total\s*:?\s*$', occurrence=1, lines_after=3)
+        discounts = popular_summary_values(r'^\s*Less\s+Discount\s*:?\s*$', lines_after=3)
+        cg = popular_summary_values(r'^\s*CGST\s*@', lines_after=3)
+        sg = popular_summary_values(r'^\s*SGST\s*@', lines_after=3)
+
+        if len(subtotal_first) >= 2:
+            result['parts_before'], result['labour_before'] = subtotal_first[0], subtotal_first[-1]
+        if len(discounts) >= 2:
+            result['parts_disc'], result['labour_disc'] = discounts[0], discounts[-1]
+        if len(cg) >= 2:
+            result['pcg'], result['lcg'] = cg[0], cg[-1]
+            result['cgst_total'] = round(result['pcg'] + result['lcg'], 2)
+        if len(sg) >= 2:
+            result['psg'], result['lsg'] = sg[0], sg[-1]
+            result['sgst_total'] = round(result['psg'] + result['lsg'], 2)
+
+        # The Popular invoice's printed Net Bill Amount value may be positioned as a
+        # separate PDF text object and omitted by text extraction. If the two net
+        # subtotal columns are available, their sum gives the rounded invoice total.
+        if len(subtotal_net) >= 2:
+            result['total'] = float(round(sum([subtotal_net[0], subtotal_net[-1]])))
+        else:
+            for line in lines:
+                if re.search(r'Net\s+Bill\s+Amount', line, re.I):
+                    vals = amounts_on_line(line)
+                    if vals:
+                        result['total'] = vals[-1]
+                        break
+
+        result['parts_disc'] = result['parts_disc'] if result['parts_disc'] is not None else 0.0
+        result['labour_disc'] = result['labour_disc'] if result['labour_disc'] is not None else 0.0
+
     return result
 
 def extract_invoice(f):
@@ -494,7 +532,14 @@ def extract_invoice(f):
             elif key == 'sgst_total': sgst_total = special[key]
             elif key == 'total': total = special[key]
 
-    gstin = first_match([r'(?i)Dealer\s+GSTIN\s*:\s*([0-9A-Z]{15})', r'(?i)GSTIN\s*[:\-]?\s*([0-9A-Z]{15})'], text)
+    # Prefer the supplier/dealer GSTIN. Some Star Motor invoices label this field
+    # as "GSTNo:" rather than "Dealer GSTIN:". Avoid matching the customer's GSTIN.
+    gstin = first_match([
+        r'(?i)Dealer\s+GSTIN\s*[:\-]?\s*([0-9A-Z]{15})',
+        r'(?i)Supplier\s+GSTIN\s*[:\-]?\s*([0-9A-Z]{15})',
+        r'(?i)\bGST\s*No\.?\s*[:\-]?\s*([0-9A-Z]{15})',
+        r'(?i)\bGSTIN\s*[:\-]?\s*([0-9A-Z]{15})'
+    ], text)
     pan = first_match([r'(?i)\bPAN\s*[:\-]?\s*([A-Z]{5}\d{4}[A-Z])\b'], text)
     job = first_match([r'(?i)Job\s*Card\s*No\.?\s*:\s*([A-Z0-9/-]+)'], text)
     irn = first_match([r'(?i)\bIRN\s*:\s*([a-f0-9]{32,})'], text)
@@ -520,8 +565,14 @@ def extract_invoice(f):
         'Parts Subtotal Before Discount': parts_before, 'Parts Discount': parts_disc,
         'Labour Subtotal Before Discount': labour_before, 'Labour Discount': labour_disc,
         'Net Labour Cost Before GST': (labour_before - (labour_disc or 0)) if labour_before is not None else None,
-        'TDS Rate': 2.0,
-        'TDS Amount (2% of Net Labour)': round(max(0, (labour_before or 0) - (labour_disc or 0)) * 0.02, 2) if labour_before is not None else None,
+        # TDS rule requested: GSTIN 6th character P => 1%; C => 2%.
+        # In both cases, calculate on net labour cost after discount and before GST.
+        'TDS Rate': (1.0 if len(str(gstin or '').strip()) >= 6 and str(gstin).strip()[5].upper() == 'P'
+                     else 2.0),
+        'TDS Amount (Net Labour)': round(
+            max(0, (labour_before or 0) - (labour_disc or 0)) *
+            (0.01 if len(str(gstin or '').strip()) >= 6 and str(gstin).strip()[5].upper() == 'P' else 0.02), 2
+        ) if labour_before is not None else None,
         'Parts CGST': pcg, 'Labour CGST': lcg, 'Parts SGST': psg, 'Labour SGST': lsg,
         'CGST Found Total': cgst_total, 'SGST Found Total': sgst_total,
         'Invoice Gross Total': total, 'Review Status': 'REVIEW REQUIRED' if review else 'EXTRACTED - VERIFY',
@@ -574,17 +625,44 @@ if uploads:
             psg=num(row,'Parts SGST'); lsg=num(row,'Labour SGST')
             gross=num(row,'Invoice Gross Total')
             net_labour=max(0.0, l-ldsc)
-            tds_amount=round(net_labour*0.02, 2)
+            gstin = str(row.get('Supplier GSTIN', '') or '').strip().upper()
+            gstin_sixth = gstin[5] if len(gstin) >= 6 else ''
+            tds_rate = 0.01 if gstin_sixth == 'P' else 0.02
+            tds_amount=round(net_labour*tds_rate, 2)
             supplier_payable=round(gross-tds_amount, 2)
-            narration=f"{source} | Receiver: SAMVREEDDHI MOBILITY PRIVATE LIMITED"
+            narration=f"{source} | Inv {inv} | Receiver: SAMVREEDDHI MOBILITY PRIVATE LIMITED"
+            # Region/ledger names aligned to the reviewed voucher workbook.
+            reg = vehicle.upper().replace(' ', '')
+            if reg.startswith('MH'):
+                region, gst_suffix = 'MUM', 'MUM'
+            elif reg.startswith(('TG', 'TS')):
+                region, gst_suffix = 'HYD', 'HYD'
+            elif reg.startswith('KA'):
+                region, gst_suffix = 'BLR', 'KAR'
+            else:
+                region, gst_suffix = 'MUM', 'MUM'
+            parts_net = max(0.0, p-pdsc)
+            labour_net = max(0.0, l-ldsc)
+            cgst_net = pcg + lcg
+            sgst_net = psg + lsg
+            # Preserve the printed invoice total when it is available; otherwise use
+            # extracted taxable components plus GST. Add a small rounding ledger only
+            # when the difference is within ₹1.00.
+            component_total = round(parts_net + labour_net + cgst_net + sgst_net, 2)
+            gross_for_payable = gross if gross > 0 else component_total
+            roundoff = round(gross_for_payable - component_total, 2)
             rows=[
-                ('Vehicle R&M_MUM',p,pdsc,'Dr',vehicle,narration),
-                ('Vehicle Labour Cost_MUM',l,ldsc,'Dr',vehicle,narration),
-                ('Input CGST_MUM',pcg+lcg,0,'Dr','',narration),
-                ('Input SGST_MUM',psg+lsg,0,'Dr','',narration),
-                (supplier,supplier_payable,0,'Cr','',narration),
-                ('TDS Payable - Section 194C',tds_amount,0,'Cr','',narration),
+                (f'Vehicle R&M_{region}',p,pdsc,'Dr',vehicle,narration),
+                (f'Vehicle Labour Cost_{region}',l,ldsc,'Dr',vehicle,narration),
+                (f'Input CGST-{gst_suffix}',pcg+lcg,0,'Dr','',narration),
+                (f'Input SGST-{gst_suffix}',psg+lsg,0,'Dr','',narration),
             ]
+            if abs(roundoff) > 0.009 and abs(roundoff) <= 1.00:
+                rows.append(('Rounding Off', abs(roundoff), 0, 'Dr' if roundoff > 0 else 'Cr', '', narration))
+            rows.extend([
+                (supplier,round(gross_for_payable-tds_amount,2),0,'Cr','',narration),
+                (f'TDS 194C {int(tds_rate*100)}%',tds_amount,0,'Cr','',narration),
+            ])
             for ledger,subtotal,discount,dc,cost,narr in rows:
                 tally_rows.append({'Voucher Name':ledger,'Voucher Number':1,'Entry Date':pd.Timestamp.today().date(),'Reference Number/Invoice Number':inv,'Invoice Date':invdate,'Sub Total':subtotal,'Discount':discount,'Net Amount':subtotal-discount,'Debit/Credit':dc,'Cost Centre':cost,'Voucher Narration':narr,'Review Status':row.get('Review Status','REVIEW REQUIRED')})
         with pd.ExcelWriter(out,engine='openpyxl') as writer:
